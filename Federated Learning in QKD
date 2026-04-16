@@ -1,0 +1,212 @@
+%% =========================================================
+%  FederFederated Deep Neural Network for Privacy-Preserving QBER Prediction in Quantum
+% Key Distribution Systems Code 
+%  Author: Raman Sharma
+%  NIT Kurukshetra 
+%% =========================================================
+
+clc; clear; close all;
+
+%% =======================
+% PARAMETERS
+%% =======================
+numClients = 5;
+numRounds = 40;
+samplesPerClient = 200;
+
+localEpochs = 5;
+learningRate = 0.002;
+
+hiddenUnits1 = 64;
+hiddenUnits2 = 32;
+
+%% =======================
+% DATASET GENERATION (BB84 Simulation)
+%% =======================
+totalSamples = numClients * samplesPerClient;
+
+distance = rand(totalSamples,1) * 100;
+attenuation = 0.2 * distance;
+detEff = 0.5 + 0.4 * rand(totalSamples,1);
+darkCount = 1e-6 + rand(totalSamples,1) * 1e-4;
+photonIntensity = 0.1 + rand(totalSamples,1);
+
+QBER = 0.02 + ...
+       0.0025 * distance + ...
+       0.08 * (1 - detEff) + ...
+       0.4 * darkCount + ...
+       0.005 * randn(totalSamples,1);
+
+QBER = max(min(QBER,0.7),0);
+
+attackLabel = QBER > 0.11;
+
+X = normalize([distance attenuation detEff darkCount photonIntensity]);
+Y = QBER;
+
+dataset = [X Y attackLabel];
+
+%% =======================
+% SPLIT DATA TO CLIENTS
+%% =======================
+clientData = cell(numClients,1);
+for i = 1:numClients
+    idx = (i-1)*samplesPerClient+1 : i*samplesPerClient;
+    clientData{i} = dataset(idx,:);
+end
+
+%% =======================
+% MODEL DEFINITION (NAMED LAYERS)
+%% =======================
+layers = [
+    featureInputLayer(5,'Normalization','none','Name','input')
+
+    fullyConnectedLayer(hiddenUnits1,'Name','fc1')
+    batchNormalizationLayer('Name','bn1')
+    reluLayer('Name','relu1')
+
+    fullyConnectedLayer(hiddenUnits2,'Name','fc2')
+    batchNormalizationLayer('Name','bn2')
+    reluLayer('Name','relu2')
+
+    fullyConnectedLayer(1,'Name','fc3')
+    regressionLayer('Name','output')
+];
+
+%% =======================
+% INITIAL GLOBAL MODEL
+%% =======================
+globalNet = trainNetwork( ...
+    clientData{1}(:,1:5), clientData{1}(:,6), ...
+    layers, ...
+    trainingOptions('adam','MaxEpochs',1,'Verbose',false));
+
+globalMAE = zeros(numRounds,1);
+trainLossRounds = zeros(numRounds,1);
+
+%% =======================
+% FEDERATED LEARNING (WEIGHTED FedAvg)
+%% =======================
+for round = 1:numRounds
+    fprintf("Federated Round %d\n",round);
+
+    % Initialize accumulators with correct sizes
+    W1 = zeros(size(globalNet.Layers(2).Weights));
+    B1 = zeros(size(globalNet.Layers(2).Bias));
+
+    W2 = zeros(size(globalNet.Layers(5).Weights));
+    B2 = zeros(size(globalNet.Layers(5).Bias));
+
+    W3 = zeros(size(globalNet.Layers(8).Weights));
+    B3 = zeros(size(globalNet.Layers(8).Bias));
+
+    clientWeights = zeros(numClients,1);
+    roundLoss = 0;
+
+    for c = 1:numClients
+        localNet = trainNetwork( ...
+            clientData{c}(:,1:5), clientData{c}(:,6), ...
+            globalNet.Layers, ...
+            trainingOptions('adam', ...
+                'MaxEpochs',localEpochs, ...
+                'MiniBatchSize',32, ...
+                'InitialLearnRate',learningRate, ...
+                'Verbose',false));
+
+        localPred = predict(localNet, clientData{c}(:,1:5));
+        clientLoss = mean(abs(localPred - clientData{c}(:,6)));
+
+        clientWeights(c) = 1 / (clientLoss + 1e-4);
+        roundLoss = roundLoss + clientLoss;
+
+        W1 = W1 + clientWeights(c) * localNet.Layers(2).Weights;
+        B1 = B1 + clientWeights(c) * localNet.Layers(2).Bias;
+
+        W2 = W2 + clientWeights(c) * localNet.Layers(5).Weights;
+        B2 = B2 + clientWeights(c) * localNet.Layers(5).Bias;
+
+        W3 = W3 + clientWeights(c) * localNet.Layers(8).Weights;
+        B3 = B3 + clientWeights(c) * localNet.Layers(8).Bias;
+    end
+
+    % Normalize weights
+    totalWeight = sum(clientWeights);
+    W1 = W1 / totalWeight;  B1 = B1 / totalWeight;
+    W2 = W2 / totalWeight;  B2 = B2 / totalWeight;
+    W3 = W3 / totalWeight;  B3 = B3 / totalWeight;
+
+    % CORRECT replaceLayer (USING NAMES)
+    lgraph = layerGraph(globalNet);
+
+    lgraph = replaceLayer(lgraph,'fc1', ...
+        fullyConnectedLayer(hiddenUnits1,'Name','fc1','Weights',W1,'Bias',B1));
+
+    lgraph = replaceLayer(lgraph,'fc2', ...
+        fullyConnectedLayer(hiddenUnits2,'Name','fc2','Weights',W2,'Bias',B2));
+
+    lgraph = replaceLayer(lgraph,'fc3', ...
+        fullyConnectedLayer(1,'Name','fc3','Weights',W3,'Bias',B3));
+
+    globalNet = assembleNetwork(lgraph);
+
+    % Global fine-tuning
+    globalNet = trainNetwork(X,Y,globalNet.Layers, ...
+        trainingOptions('adam','MaxEpochs',1,'Verbose',false));
+
+    pred = predict(globalNet,X);
+    globalMAE(round) = mean(abs(pred - Y));
+    trainLossRounds(round) = roundLoss / numClients;
+
+    fprintf("Global MAE = %.4f\n",globalMAE(round));
+end
+
+%% =======================
+% CENTRALIZED LEARNING
+%% =======================
+centralModel = trainNetwork(X,Y,layers, ...
+    trainingOptions('adam','MaxEpochs',50,'Verbose',false));
+
+centralPred = predict(centralModel,X);
+centralMAE = mean(abs(centralPred - Y));
+
+%% =======================
+% RESULTS & GRAPHS
+%% =======================
+
+figure;
+scatter(Y,pred,'filled');
+xlabel('Actual QBER'); ylabel('Predicted QBER');
+title('Actual vs Predicted QBER (Federated Learning)');
+grid on;
+
+figure;
+histogram(abs(pred - Y),30);
+xlabel('Absolute Error'); ylabel('Frequency');
+title('QBER Prediction Error Distribution');
+grid on;
+
+figure;
+plot(globalMAE,'LineWidth',2);
+xlabel('Federated Rounds'); ylabel('MAE');
+title('Federated Learning Convergence');
+grid on;
+
+figure;
+bar([mean(globalMAE) centralMAE]);
+set(gca,'xticklabel',{'Federated Learning','Centralized Learning'});
+ylabel('Mean Absolute Error');
+title('FL vs Centralized Learning');
+grid on;
+
+figure;
+attackPred = pred > 0.11;
+confusionchart(attackLabel,attackPred);
+title('Eavesdropping Detection Confusion Matrix');
+
+exportgraphics(figure(1),'Figure1_QBER_Prediction.png','Resolution',300);
+exportgraphics(figure(2),'Figure2_Error_Distribution.png','Resolution',300);
+exportgraphics(figure(3),'Figure3_Convergence.png','Resolution',300);
+exportgraphics(figure(4),'Figure4_FL_vs_Centralized.png','Resolution',300);
+exportgraphics(figure(5),'Figure5_Confusion_Matrix.png','Resolution',300);
+
+
